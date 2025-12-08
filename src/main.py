@@ -1,8 +1,10 @@
 import os
 import json
+from pathlib import Path
+from datetime import datetime
+
 import stripe
 import requests
-from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
@@ -19,6 +21,7 @@ VIP_CHANNEL_ID_RAW = os.getenv("VIP_CHANNEL_ID")  # string from .env
 VIP_STATIC_INVITE_LINK = os.getenv("VIP_STATIC_INVITE_LINK")  # fallback link
 
 TEST_TELEGRAM_USER_ID = os.getenv("TEST_TELEGRAM_USER_ID")  # for stripe trigger tests
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "changeme")
 
 # VIP channel ID as int if available
 VIP_CHANNEL_ID = int(VIP_CHANNEL_ID_RAW) if VIP_CHANNEL_ID_RAW else None
@@ -29,13 +32,12 @@ TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 app = Flask(__name__)
 
-# File to persist subscription -> telegram mapping
+# ---------------------------------
+# SUBSCRIPTIONS STORAGE
+# ---------------------------------
 SUBSCRIPTIONS_FILE = Path(__file__).resolve().parent / "subscriptions.json"
 
 
-# ---------------------------------
-# UTILS: SUBSCRIPTIONS STORAGE
-# ---------------------------------
 def load_subscriptions() -> dict:
     if not SUBSCRIPTIONS_FILE.exists():
         return {}
@@ -53,6 +55,39 @@ def save_subscriptions(data: dict) -> None:
             json.dump(data, f, indent=2)
     except Exception as e:
         print("Error saving subscriptions.json:", e)
+
+
+def record_subscription(telegram_user_id: str, subscription_id: str, plan: str, status: str, current_period_end: int | None):
+    subs = load_subscriptions()
+    subs[str(telegram_user_id)] = {
+        "subscription_id": subscription_id,
+        "plan": plan,
+        "status": status,
+        "current_period_end": current_period_end,
+    }
+    save_subscriptions(subs)
+
+
+def update_subscription_status(subscription_id: str, status: str, current_period_end: int | None = None) -> bool:
+    subs = load_subscriptions()
+    changed = False
+    for tid, info in subs.items():
+        if info.get("subscription_id") == subscription_id:
+            info["status"] = status
+            if current_period_end is not None:
+                info["current_period_end"] = current_period_end
+            changed = True
+    if changed:
+        save_subscriptions(subs)
+    return changed
+
+
+def find_telegram_by_subscription(subscription_id: str) -> str | None:
+    subs = load_subscriptions()
+    for tid, info in subs.items():
+        if info.get("subscription_id") == subscription_id:
+            return tid
+    return None
 
 
 # ---------------------------------
@@ -130,7 +165,7 @@ def remove_user_from_vip(telegram_user_id: str):
         print("⚠ VIP_CHANNEL_ID not set; cannot remove user.")
         return
 
-    # Newer Telegram API uses banChatMember/unbanChatMember pattern
+    # ban + unban pattern to just kick them
     ban_url = f"{TELEGRAM_API_BASE}/banChatMember"
     unban_url = f"{TELEGRAM_API_BASE}/unbanChatMember"
 
@@ -139,7 +174,6 @@ def remove_user_from_vip(telegram_user_id: str):
     try:
         r = requests.post(ban_url, json=payload, timeout=10)
         print("Telegram banChatMember response:", r.text)
-        # Immediately unban so they are just kicked, not permanently banned
         r2 = requests.post(unban_url, json=payload, timeout=10)
         print("Telegram unbanChatMember response:", r2.text)
     except Exception as e:
@@ -222,14 +256,14 @@ def stripe_webhook():
     print("✅ Stripe event:", event_type)
 
     # -------------------------
-    # PAYMENT SUCCESS
+    # PAYMENT SUCCESS: new subscription
     # -------------------------
     if event_type == "checkout.session.completed":
         session = obj
         metadata = session.get("metadata", {}) or {}
         telegram_user_id = metadata.get("telegram_user_id")
         plan = metadata.get("plan", "test-plan")
-        subscription_id = session.get("subscription")  # may be None in tests
+        subscription_id = session.get("subscription")
 
         print("🔥 Payment metadata:", metadata)
         print("Subscription ID:", subscription_id)
@@ -239,13 +273,29 @@ def stripe_webhook():
             telegram_user_id = TEST_TELEGRAM_USER_ID
             print("ℹ Using TEST_TELEGRAM_USER_ID:", telegram_user_id)
 
-        # Store subscription -> telegram mapping (for real subscriptions)
-        if subscription_id and telegram_user_id:
-            subs = load_subscriptions()
-            subs[str(subscription_id)] = str(telegram_user_id)
-            save_subscriptions(subs)
-            print("💾 Stored subscription mapping:", subs)
+        # Use subscription current_period_end if present
+        current_period_end = None
+        status = "active"
+        if subscription_id:
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                current_period_end = sub["current_period_end"]
+                status = sub["status"]
+            except Exception as e:
+                print("Error retrieving subscription:", e)
 
+        # Store subscription -> telegram mapping
+        if telegram_user_id and subscription_id:
+            record_subscription(
+                telegram_user_id=str(telegram_user_id),
+                subscription_id=subscription_id,
+                plan=plan,
+                status=status,
+                current_period_end=current_period_end,
+            )
+            print("💾 Stored subscription for user:", telegram_user_id)
+
+        # Send VIP welcome + invite link
         if telegram_user_id:
             invite_link = get_vip_invite_link()
 
@@ -265,16 +315,44 @@ def stripe_webhook():
             )
 
     # -------------------------
+    # SUBSCRIPTION RENEWAL SUCCESS
+    # -------------------------
+    elif event_type == "invoice.payment_succeeded":
+        invoice = obj
+        subscription_id = invoice.get("subscription")
+        print("💸 Invoice payment succeeded. Subscription:", subscription_id)
+
+        if subscription_id:
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                current_period_end = sub["current_period_end"]
+                status = sub["status"]
+                updated = update_subscription_status(subscription_id, status, current_period_end)
+                print(f"Updated subscription status on renewal: {updated}")
+            except Exception as e:
+                print("Error updating subscription on renewal:", e)
+
+            # Optional: notify user that renewal succeeded
+            telegram_user_id = find_telegram_by_subscription(subscription_id)
+            if telegram_user_id:
+                send_telegram_message(
+                    chat_id=telegram_user_id,
+                    text=(
+                        "✅ Your ZoneFlow FX VIP subscription has been renewed successfully.\n\n"
+                        "Your VIP access remains active. 🚀"
+                    ),
+                )
+
+    # -------------------------
     # SUBSCRIPTION CANCELED / ENDED
     # -------------------------
     elif event_type == "customer.subscription.deleted":
         subscription = obj
-        subscription_id = str(subscription.get("id"))
+        subscription_id = subscription.get("id")
         print("🧾 Subscription deleted:", subscription_id)
 
-        subs = load_subscriptions()
-        telegram_user_id = subs.pop(subscription_id, None)
-        save_subscriptions(subs)
+        updated = update_subscription_status(subscription_id, "canceled", subscription.get("current_period_end"))
+        telegram_user_id = find_telegram_by_subscription(subscription_id)
 
         if telegram_user_id:
             print("Removing user from VIP for ended subscription:", telegram_user_id)
@@ -291,31 +369,44 @@ def stripe_webhook():
             print("No stored Telegram user for subscription:", subscription_id)
 
     # -------------------------
-    # SUBSCRIPTION RENEWAL SUCCESS
+    # PAYMENT FAILURE (optional)
     # -------------------------
-    elif event_type == "invoice.payment_succeeded":
+    elif event_type == "invoice.payment_failed":
         invoice = obj
         subscription_id = invoice.get("subscription")
-        print("💸 Invoice payment succeeded. Subscription:", subscription_id)
-
+        print("❌ Invoice payment failed. Subscription:", subscription_id)
         if subscription_id:
-            subs = load_subscriptions()
-            telegram_user_id = subs.get(str(subscription_id))
-            if telegram_user_id:
-                send_telegram_message(
-                    chat_id=telegram_user_id,
-                    text=(
-                        "✅ Your ZoneFlow FX VIP subscription has been renewed successfully.\n\n"
-                        "Your VIP access remains active. 🚀"
-                    ),
-                )
-            else:
-                print(
-                    "No Telegram user stored for subscription on renewal:",
-                    subscription_id,
-                )
+            updated = update_subscription_status(subscription_id, "past_due")
+            print(f"Marked subscription as past_due: {updated}")
 
     return "OK", 200
+
+
+# ---------------------------------
+# ADMIN ENDPOINTS
+# ---------------------------------
+def require_admin(req) -> bool:
+    key = req.headers.get("X-Admin-Key")
+    return bool(key and key == ADMIN_API_KEY)
+
+
+@app.route("/admin/subscriptions", methods=["GET"])
+def admin_subscriptions():
+    if not require_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    subs = load_subscriptions()
+    return jsonify(subs)
+
+
+@app.route("/admin/subscription/<telegram_id>", methods=["GET"])
+def admin_subscription_detail(telegram_id):
+    if not require_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    subs = load_subscriptions()
+    info = subs.get(str(telegram_id))
+    if not info:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(info)
 
 
 # ---------------------------------
@@ -330,4 +421,3 @@ if __name__ == "__main__":
     print("Payment service running...")
     port = int(os.getenv("PORT", 5005))
     app.run(host="0.0.0.0", port=port)
-
