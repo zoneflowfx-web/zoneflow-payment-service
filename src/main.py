@@ -195,9 +195,9 @@ def create_checkout_session():
 
     # Stripe Price IDs
     PRICE_IDS = {
-        "monthly": "price_1SbrNsLs179MoCfO5dwM0Cmh",
-        "quarterly": "price_1SbrOvLs179MoCfOt2we2JcS",
-        "yearly": "price_1SbrPiLs179MoCfO8Vp9sXmA",
+        "monthly": "price_1ScPFULs179MoCfOmTDllLJw",
+        "quarterly": "price_1ScPG3Ls179MoCfOEXdb95XW",
+        "yearly": "price_1ScPGSLs179MoCfOaTXgEoOL",
     }
 
     if plan not in PRICE_IDS:
