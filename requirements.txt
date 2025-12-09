@@ -2,3 +2,4 @@ flask
 stripe
 python-dotenv
 requests
+flask-cors
